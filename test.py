@@ -90,21 +90,59 @@ def extract_bcp_negative_transactions_from_bytes(pdf_bytes: bytes, default_year:
                     continue
 
                 dd, mm = int(md.group(1)), int(md.group(2))
+
+                # Busca montos con decimales y opcional '-'
                 amounts = AMT_TOKEN_RE.findall(line)
-                if len(amounts) < 2:
+                if not amounts:
                     continue
 
-                cargo = amounts[-2]
-                if not cargo.endswith("-"):
+                # ✅ En tu PDF hay líneas donde solo aparece el cargo negativo (ej 110.23-)
+                # así que tomamos el ÚLTIMO monto negativo en la línea (si existe).:contentReference[oaicite:3]{index=3}
+                neg_tok = None
+                for a in reversed(amounts):
+                    if a.endswith("-"):
+                        neg_tok = a
+                        break
+                if not neg_tok:
                     continue
 
-                amt = -decimal_2(cargo[:-1])
+                amt = -decimal_2(neg_tok[:-1])
+                num_op = extract_num_op_from_line(line)
 
-                tx.append(
-                    {"page": pnum, "fecha_proc": date(year, mm, dd), "amount": amt, "line": line.strip()}
-                )
+                tx.append({
+                    "page": pnum,
+                    "fecha_proc": date(year, mm, dd),
+                    "num_op": num_op,
+                    "amount": amt,       # negativo
+                    "line": line.strip(),
+                })
+
     return tx
 
+
+TIME_RE = re.compile(r"\b\d{2}:\d{2}\b")
+
+def extract_num_op_from_line(line: str) -> str:
+    """
+    BCP: NUM OP suele estar inmediatamente antes de la HORA (HH:MM).
+    Ej: '... 408357 07:53 ... 110.23-':contentReference[oaicite:2]{index=2}
+    También hay líneas tipo ITF: '... INT - 0909 .30-' (sin hora).
+    """
+    tokens = line.strip().split()
+
+    # Caso 1: hay hora -> token anterior es NUM OP
+    for i, tok in enumerate(tokens):
+        if TIME_RE.fullmatch(tok):
+            if i > 0 and re.fullmatch(r"\d{3,}", tokens[i - 1] or ""):
+                return tokens[i - 1]
+            break
+
+    # Caso 2: líneas sin hora, tipo "... - 0909 .30-"
+    m = re.search(r"\b-\s*(\d{3,})\b", line)
+    if m:
+        return m.group(1)
+
+    return ""
 
 def run_match(pdf_bytes: bytes, sire_bytes: bytes):
     wb = openpyxl.load_workbook(BytesIO(sire_bytes), data_only=True)
@@ -172,14 +210,17 @@ def run_match(pdf_bytes: bytes, sire_bytes: bytes):
 
         matches.append(
             {
-                "Fecha emision": sire_date,
+                "Fecha emision": sire_date,  # sigue siendo la del Excel SIRE
                 "Nro Doc Identidad": docid_str,
                 "Apellidos Nombre / Razon Social": nombre,
+
+                "FECHA PROC": bcp_tx[idx]["fecha_proc"],
+                "NUM OP": bcp_tx[idx].get("num_op", ""),
+
                 "Total CP": float(amt),
-                "_bcp_fecha_proc": chosen_d,
-                "_bcp_page": bcp_tx[idx]["page"],
             }
         )
+
 
     return matches
 
@@ -189,21 +230,34 @@ def build_xlsx_bytes(matches: list[dict]) -> bytes:
     out_ws = out_wb.active
     out_ws.title = "matches"
 
-    headers = ["Fecha emision", "Nro Doc Identidad", "Apellidos Nombre / Razon Social", "Total CP"]
+    headers = ["Fecha emision", "Nro Doc Identidad", "Apellidos Nombre / Razon Social", "FECHA PROC", "NUM OP", "Total CP"]
     out_ws.append(headers)
 
     for m in matches:
-        out_ws.append([m["Fecha emision"], m["Nro Doc Identidad"], m["Apellidos Nombre / Razon Social"], m["Total CP"]])
+        out_ws.append([
+            m["Fecha emision"],
+            m["Nro Doc Identidad"],
+            m["Apellidos Nombre / Razon Social"],
+            m["FECHA PROC"],
+            m["NUM OP"],
+            m["Total CP"],
+        ])
 
+    # formatos
     out_ws.column_dimensions["A"].width = 14
     out_ws.column_dimensions["B"].width = 18
     out_ws.column_dimensions["C"].width = 55
-    out_ws.column_dimensions["D"].width = 12
+    out_ws.column_dimensions["D"].width = 14
+    out_ws.column_dimensions["E"].width = 14
+    out_ws.column_dimensions["F"].width = 12
 
     for cell in out_ws["A"][1:]:
         cell.number_format = "dd/mm/yyyy"
     for cell in out_ws["D"][1:]:
+        cell.number_format = "dd/mm/yyyy"
+    for cell in out_ws["F"][1:]:
         cell.number_format = "0.00"
+
 
     bio = BytesIO()
     out_wb.save(bio)
@@ -211,12 +265,14 @@ def build_xlsx_bytes(matches: list[dict]) -> bytes:
 
 
 def build_txt_bytes(matches: list[dict]) -> bytes:
-    headers = ["Fecha emision", "Nro Doc Identidad", "Apellidos Nombre / Razon Social", "Total CP"]
+    headers = ["Fecha emision", "Nro Doc Identidad", "Apellidos Nombre / Razon Social", "FECHA PROC", "NUM OP", "Total CP"]
     lines = ["|".join(headers)]
     for m in matches:
         lines.append(
-            f"{m['Fecha emision'].strftime('%d/%m/%Y')}|{m['Nro Doc Identidad']}|{m['Apellidos Nombre / Razon Social']}|{m['Total CP']:.2f}"
+            f"{m['Fecha emision'].strftime('%d/%m/%Y')}|{m['Nro Doc Identidad']}|{m['Apellidos Nombre / Razon Social']}|"
+            f"{m['FECHA PROC'].strftime('%d/%m/%Y')}|{m['NUM OP']}|{m['Total CP']:.2f}"
         )
+    
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -258,6 +314,8 @@ if run:
                     "Fecha emision": m["Fecha emision"].strftime("%d/%m/%Y"),
                     "Nro Doc Identidad": m["Nro Doc Identidad"],
                     "Apellidos Nombre / Razon Social": m["Apellidos Nombre / Razon Social"],
+                    "FECHA PROC": m["FECHA PROC"].strftime("%d/%m/%Y"),
+                    "NUM OP": m["NUM OP"],
                     "Total CP": f"{m['Total CP']:.2f}",
                 }
                 for m in matches
